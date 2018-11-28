@@ -2,6 +2,7 @@
 # define _WIN32
 #endif
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -10,6 +11,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <complex.h>
+#include <stdbool.h>
 
 #ifdef _WIN32
 #include <GL/glew.h>
@@ -26,7 +29,7 @@ struct app_state
 	struct fosphor_render render_zoom;
 
 	FILE *src_fh;
-	void *src_buf;
+	complex float * src_buf;
 
 	int w, h;
 
@@ -34,6 +37,7 @@ struct app_state
 	float ratio;
 	double zoom_width, zoom_center;
 	int zoom_enable;
+    bool paused;
 };
 
 static struct app_state _g_as, *g_as = &_g_as;
@@ -132,14 +136,13 @@ time_toc(const char *str)
 /* GLFW                                                                     */
 /* ------------------------------------------------------------------------ */
 
-#define BATCH_LEN	128
-#define BATCH_COUNT	4
+#define BATCH_LEN	256
+#define BATCH_COUNT	1
 
 static void
 glfw_render(GLFWwindow *wnd)
 {
 	static int fc = 0;
-	int c, r, o;
 
 	/* Timing */
 	if (!fc)
@@ -161,25 +164,27 @@ glfw_render(GLFWwindow *wnd)
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	/* Process some samples */
-	for (c=0; c<BATCH_COUNT; c++) {
-		r = sizeof(float) * 2 * FOSPHOR_FFT_LEN * BATCH_LEN;
-		o = 0;
+	for (int c = 0; c < BATCH_COUNT; c++) {
+		int remaining = FOSPHOR_FFT_LEN * BATCH_LEN;
+		complex float * dst = g_as->src_buf;
 
-		while (r) {
-			int rc;
-
-			rc = fread((char*)g_as->src_buf + o, 1, r, g_as->src_fh);
-			if (rc <= 0) {
-				if (fseek(g_as->src_fh, 0, SEEK_SET))
-					abort();
+		while (remaining > 0) {
+			size_t n_read;
+			if (!(n_read = fread(dst, sizeof(complex float), remaining, g_as->src_fh))) {
+				if (fseek(g_as->src_fh, 0, SEEK_SET)) exit(1);
 				continue;
 			}
-
-			r -= rc;
-			o += rc;
+			remaining -= n_read;
+			dst += n_read;
 		}
 
-		fosphor_process(g_as->fosphor, g_as->src_buf, FOSPHOR_FFT_LEN * BATCH_LEN);
+                if (!g_as->paused) {
+                    int rc = fosphor_process(g_as->fosphor, g_as->src_buf, FOSPHOR_FFT_LEN * BATCH_LEN);
+                    if (rc) {
+                        fprintf(stderr, "fosphor_process returned %d\n", rc);
+                        abort();
+                    }
+                }
 	}
 
 	/* Draw fosphor */
@@ -327,7 +332,11 @@ glfw_cb_key(GLFWwindow *wnd, int key, int scancode, int action, int mods)
 		if (g_as->ratio > 0.2f)
 			g_as->ratio -= 0.1f;
 		break;
-	}
+
+        case GLFW_KEY_SPACE:
+            g_as->paused = !g_as->paused;
+            break;
+        }
 
 	_update_fosphor();
 }
@@ -353,7 +362,7 @@ glfw_init(void)
 #endif
 
 	/* Disable VSync to test speed */
-	glfwSwapInterval(0);
+	/* glfwSwapInterval(0); */
 
 	/* Callbacks */
 	glfwSetFramebufferSizeCallback(wnd, glfw_cb_reshape);
@@ -396,7 +405,7 @@ int main(int argc, char *argv[])
 		return -EINVAL;;
 	}
 
-	g_as->src_buf = malloc(2 * sizeof(float) * FOSPHOR_FFT_LEN * FOSPHOR_FFT_MAX_BATCH);
+	g_as->src_buf = calloc(FOSPHOR_FFT_LEN * BATCH_LEN, sizeof(complex float));
 	if (!g_as->src_buf) {
 		rv = -ENOMEM;
 		goto error;
@@ -416,6 +425,8 @@ int main(int argc, char *argv[])
 
 	g_as->render_main.histo_wf_ratio = 0.35f;
 	g_as->render_zoom.histo_wf_ratio = 0.35f;
+
+        g_as->paused = false;
 
 	/* Init GLFW */
 	wnd = glfw_init();
